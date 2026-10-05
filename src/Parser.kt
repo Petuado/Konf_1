@@ -28,7 +28,6 @@ object Parser {
             val c = text[i]
 
             when {
-                // Экранированный доллар: \$ → $
                 c == '\\' && i + 1 < text.length && text[i + 1] == '$' -> {
                     sb.append(ESCAPED_DOLLAR)
                     i += 2
@@ -36,7 +35,6 @@ object Parser {
 
                 c == '$' -> {
                     val consumed = appendVariable(text, i, sb, env)
-                    // Если после $ ничего осмысленного — просто копируем $
                     if (consumed == 0) {
                         sb.append(c)
                         i++
