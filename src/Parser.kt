@@ -1,79 +1,121 @@
-package ru.vfsshell
-
-private val ENV_VAR_START = '$'
-
-/** Ошибка разбора строки команды. */
-class ParseException(message: String) : Exception(message)
+package vfs
 
 /**
- * Парсер строки команды: раскрытие переменных окружения и токенизация.
+ * Парсер командной строки и раскрытие переменных окружения.
  *
- * @property env карта переменных окружения (по умолчанию — системные).
+ * Поддерживаются формы: $VAR, ${VAR}, экранирование \$VAR.
+ * Переменные берутся из реального окружения ОС (System.getenv).
  */
-class Parser(private val env: Map<String, String> = System.getenv()) {
+object Parser {
 
-    /** Разбирает строку на токены, раскрывая `$VAR` и `${VAR}`. */
-    fun parse(line: String): List<String> =
-        tokenize(expandEnvVars(line))
+    private const val ESCAPED_DOLLAR = '$'
 
-    /** Раскрывает переменные окружения в строке. */
-    fun expandEnvVars(text: String): String {
-        val out = StringBuilder()
+    /**
+     * Раскрывает переменные окружения в строке.
+     *
+     * @param text исходная строка пользователя
+     * @param env  функция доступа к переменной окружения (по умолчанию System.getenv)
+     * @return строка с раскрытыми переменными
+     */
+    fun expandEnvVars(
+        text: String,
+        env: (String) -> String? = { System.getenv(it) }
+    ): String {
+        val sb = StringBuilder(text.length)
         var i = 0
+
         while (i < text.length) {
-            i = if (text[i] == ENV_VAR_START) {
-                i + appendVar(text, i, out)
-            } else {
-                out.append(text[i]); i + 1
-            }
-        }
-        return out.toString()
-    }
+            val c = text[i]
 
-    /** Поглощает одну переменную, возвращает число съеденных символов. */
-    private fun appendVar(text: String, start: Int, out: StringBuilder): Int {
-        val next = text.getOrNull(start + 1)
-        if (next == null) { out.append(ENV_VAR_START); return 1 }
-        if (next == '{') return appendBraced(text, start, out)
-        if (next.isLetter() || next == '_') return appendPlain(text, start, out)
-        out.append(ENV_VAR_START); return 1
-    }
-
-    /** Раскрывает форму `${VAR}`. */
-    private fun appendBraced(text: String, start: Int, out: StringBuilder): Int {
-        val end = text.indexOf('}', start + 2)
-        if (end < 0) { out.append(text.substring(start)); return text.length - start }
-        out.append(env[text.substring(start + 2, end)] ?: "")
-        return end - start + 1
-    }
-
-    /** Раскрывает форму `$VAR`. */
-    private fun appendPlain(text: String, start: Int, out: StringBuilder): Int {
-        var j = start + 1
-        while (j < text.length && (text[j].isLetterOrDigit() || text[j] == '_')) j++
-        out.append(env[text.substring(start + 1, j)] ?: "")
-        return j - start
-    }
-
-    /** Токенизирует строку с учётом одинарных и двойных кавычек. */
-    private fun tokenize(text: String): List<String> {
-        val tokens = mutableListOf<String>()
-        val current = StringBuilder()
-        var inSingle = false
-        var inDouble = false
-        var started = false
-        for (ch in text) {
             when {
-                ch == '\'' && !inDouble -> { inSingle = !inSingle; started = true }
-                ch == '"' && !inSingle -> { inDouble = !inDouble; started = true }
-                ch.isWhitespace() && !inSingle && !inDouble -> {
-                    if (started) { tokens.add(current.toString()); current.clear(); started = false }
+                // Экранированный доллар: \$ → $
+                c == '\\' && i + 1 < text.length && text[i + 1] == '$' -> {
+                    sb.append(ESCAPED_DOLLAR)
+                    i += 2
                 }
-                else -> { current.append(ch); started = true }
+
+                c == '$' -> {
+                    val consumed = appendVariable(text, i, sb, env)
+                    // Если после $ ничего осмысленного — просто копируем $
+                    if (consumed == 0) {
+                        sb.append(c)
+                        i++
+                    } else {
+                        i += consumed
+                    }
+                }
+
+                else -> {
+                    sb.append(c)
+                    i++
+                }
             }
         }
-        if (inSingle || inDouble) throw ParseException("незакрытая кавычка")
-        if (started) tokens.add(current.toString())
-        return tokens
+        return sb.toString()
     }
+
+    /**
+     * Пытается прочитать переменную начиная с позиции '$' (индекс [start]) и
+     * записать её значение в [sb].
+     *
+     * @return количество съеденных символов исходной строки (включая '$');
+     *         0 — если после '$' переменной нет.
+     */
+    private fun appendVariable(
+        text: String,
+        start: Int,
+        sb: StringBuilder,
+        env: (String) -> String?
+    ): Int {
+        val braceResult = readBracedVar(text, start)
+        if (braceResult != null) {
+            val (name, length) = braceResult
+            sb.append(env(name) ?: "\${$name}")
+            return length
+        }
+
+        val namedResult = readNamedVar(text, start)
+        if (namedResult != null) {
+            val (name, length) = namedResult
+            sb.append(env(name) ?: "\$$name")
+            return length
+        }
+
+        return 0
+    }
+
+    /**
+     * Читает форму ${NAME}.
+     *
+     * @return пара (имя, длина) или null, если форма не распознана.
+     */
+    private fun readBracedVar(text: String, start: Int): Pair<String, Int>? {
+        if (start + 1 >= text.length || text[start + 1] != '{') return null
+
+        val end = text.indexOf('}', start + 2)
+        if (end == -1) return null
+
+        val name = text.substring(start + 2, end)
+        return name to (end - start + 1)
+    }
+
+    /**
+     * Читает форму $NAME.
+     *
+     * @return пара (имя, длина) или null, если имя не начинается корректно.
+     */
+    private fun readNamedVar(text: String, start: Int): Pair<String, Int>? {
+        if (start + 1 >= text.length) return null
+        if (!isNameStart(text[start + 1])) return null
+
+        var j = start + 2
+        while (j < text.length && isNamePart(text[j])) j++
+
+        val name = text.substring(start + 1, j)
+        return name to (j - start)
+    }
+
+    private fun isNameStart(c: Char): Boolean = c.isLetter() || c == '_'
+
+    private fun isNamePart(c: Char): Boolean = c.isLetterOrDigit() || c == '_'
 }
