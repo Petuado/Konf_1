@@ -96,7 +96,6 @@ object Parser {
         val name = text.substring(start + 2, end)
         return name to (end - start + 1)
     }
-
     /**
      * Читает форму $NAME.
      *
